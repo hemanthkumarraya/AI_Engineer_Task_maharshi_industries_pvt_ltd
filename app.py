@@ -86,7 +86,7 @@ def process_image(image, threshold):
         with torch.no_grad():
             output = classifier(input_tensor)
         pred_idx = output.argmax(1).item()
-        label = "Human" if pred_idx == 0 else "Animal"
+        label = "Animal" if pred_idx == 0 else "Human"
         conf = torch.softmax(output, dim=1).max().item()
         
         crops.append(crop)
