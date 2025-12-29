@@ -12,15 +12,12 @@ import tempfile
 import os
 import json
 
-# ==================== PAGE CONFIG & TITLE ====================
+# ==================== GLOBAL SETTINGS ====================
+torch.set_grad_enabled(False)
+DEVICE = torch.device("cpu")
+
 st.set_page_config(page_title="Industrial AI System", layout="wide")
 st.title("🛠️ Industrial AI Vision System")
-st.markdown("""
-**Fully Offline Computer Vision Pipeline**  
-Two tasks in one app:  
-1. **Object Detection + Human/Animal Classification**  
-2. **Offline Industrial OCR** (faded stenciled text on boxes)
-""")
 
 # ==================== SIDEBAR ====================
 st.sidebar.header("⚙️ Task Selection")
@@ -29,275 +26,146 @@ mode = st.sidebar.selectbox(
     ["Object Detection + Human/Animal Classification", "Offline Industrial OCR"]
 )
 
-st.sidebar.header("Settings")
-conf_threshold = st.sidebar.slider(
-    "Confidence Threshold",
-    min_value=0.1, max_value=0.95, value=0.5, step=0.05,
-    help="Higher = stricter detections/OCR"
-)
+st.sidebar.header("Detection Settings")
+det_conf = st.sidebar.slider("Detection Confidence", 0.1, 0.95, 0.5, 0.05)
 
-# ==================== MODEL PATHS ====================
+st.sidebar.header("OCR Settings")
+ocr_conf = st.sidebar.slider("OCR Confidence", 0.3, 0.95, 0.7, 0.05)
+
+# ==================== PATHS ====================
 DETECTOR_PATH = "faster_rcnn_object_detector_FAST.pth"
 CLASSIFIER_PATH = "animal_classifier.pth"
 
-# ==================== HELPER: NO AUTO-ROTATION ====================
+# ==================== IMAGE LOADERS ====================
 def load_image_no_rotate(uploaded_file):
-    """Load image without applying EXIF orientation (keeps original as-is)"""
     uploaded_file.seek(0)
-    image = Image.open(uploaded_file)
-    # Remove EXIF to prevent rotation
-    image = image.copy()
-    if 'exif' in image.info:
-        image.info.pop('exif')
-    return image
-
-def cv2_imread_no_rotate(uploaded_file):
-    """Read with OpenCV ignoring EXIF rotation"""
-    uploaded_file.seek(0)
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
+    img = Image.open(uploaded_file).copy()
+    img.info.pop("exif", None)
     return img
 
-# ==================== MODEL LOADING (CACHED + CPU) ====================
+def cv2_imread_no_rotate(uploaded_file):
+    uploaded_file.seek(0)
+    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+    return cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+# ==================== MODELS ====================
 @st.cache_resource
 def load_detector():
-    model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None, num_classes=2)
+    if not os.path.exists(DETECTOR_PATH):
+        st.error("Detector model missing")
+        st.stop()
+
+    model = fasterrcnn_mobilenet_v3_large_320_fpn(weights=None)
     in_features = model.roi_heads.box_predictor.cls_score.in_features
     model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)
-    model.load_state_dict(torch.load(DETECTOR_PATH, map_location="cpu"))
-    model.eval()
+    model.load_state_dict(torch.load(DETECTOR_PATH, map_location=DEVICE))
+    model.to(DEVICE).eval()
     return model
 
 @st.cache_resource
 def load_classifier():
+    if not os.path.exists(CLASSIFIER_PATH):
+        st.error("Classifier model missing")
+        st.stop()
+
     model = resnet18(weights=None)
     model.fc = torch.nn.Linear(model.fc.in_features, 2)
-    model.load_state_dict(torch.load(CLASSIFIER_PATH, map_location="cpu"))
-    model.eval()
+    model.load_state_dict(torch.load(CLASSIFIER_PATH, map_location=DEVICE))
+    model.to(DEVICE).eval()
     return model
 
 @st.cache_resource
 def load_ocr():
-    return PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False, show_log=False)
+    return PaddleOCR(use_angle_cls=True, lang="en", use_gpu=False)
 
-# Transforms
-classify_transform = transforms.Compose([
+# ==================== TRANSFORMS ====================
+classify_tf = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    transforms.Normalize([0.485, 0.456, 0.406],
+                         [0.229, 0.224, 0.225])
 ])
 
-# ==================== PART A: Detection + Classification ====================
+CLASS_NAMES = {0: "Animal", 1: "Human"}
+
+# ==================== PART A ====================
 if mode == "Object Detection + Human/Animal Classification":
-    st.header("🔍 Object Detection + Human/Animal Classification")
-    st.markdown("Detects objects → Classifies as **Human** (Green) or **Animal** (Red)")
 
     detector = load_detector()
     classifier = load_classifier()
 
-    def process_image_part_a(image_bgr, threshold):
-        img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        img_tensor = transforms.ToTensor()(img_rgb).unsqueeze(0)
+    def process_frame(frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        tensor = transforms.ToTensor()(rgb).unsqueeze(0)
 
-        with torch.no_grad():
-            predictions = detector(img_tensor)[0]
+        preds = detector(tensor)[0]
+        keep = preds["scores"] > det_conf
 
-        boxes = predictions['boxes'][predictions['scores'] > threshold].cpu().numpy()
-        scores = predictions['scores'][predictions['scores'] > threshold].cpu().numpy()
+        boxes = preds["boxes"][keep].cpu().numpy()
+        scores = preds["scores"][keep].cpu().numpy()
 
-        output_img = image_bgr.copy()
-        crops = []
-        results = []
-
-        for box, score in zip(boxes, scores):
+        for box in boxes:
             x1, y1, x2, y2 = map(int, box)
-            crop = img_rgb[y1:y2, x1:x2]
+            crop = rgb[y1:y2, x1:x2]
             if crop.size == 0:
                 continue
 
-            crop_pil = Image.fromarray(crop)
-            input_tensor = classify_transform(crop_pil).unsqueeze(0)
-            with torch.no_grad():
-                output = classifier(input_tensor)
-            pred_idx = output.argmax(1).item()
-            label = "Animal" if pred_idx == 0 else "Human"
-            conf = torch.softmax(output, dim=1)[0][pred_idx].item()
+            inp = classify_tf(Image.fromarray(crop)).unsqueeze(0)
+            out = classifier(inp)
+            idx = out.argmax(1).item()
+            conf = torch.softmax(out, 1)[0][idx].item()
+            label = CLASS_NAMES[idx]
 
-            crops.append(crop)
-            results.append((label, conf))
+            color = (0, 255, 0) if label == "Human" else (0, 0, 255)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(frame, f"{label} {conf:.2f}",
+                        (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-            color = (0, 0, 255) if label == "Animal" else (0, 255, 0)
-            cv2.rectangle(output_img, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(output_img, f"{label} ({conf:.2f})", (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 3)
+        return frame
 
-        return output_img, crops, results
-
-    uploaded = st.file_uploader("Upload Image or Video", type=["jpg", "jpeg", "png", "mp4"], key="a")
+    uploaded = st.file_uploader("Upload Image or Video", ["jpg", "png", "mp4"])
 
     if uploaded:
         if uploaded.type.startswith("image"):
-            st.subheader("Original Image (No Auto-Rotation)")
-            original_img = load_image_no_rotate(uploaded)
-            st.image(original_img, use_column_width=True)
+            img = cv2_imread_no_rotate(uploaded)
+            out = process_frame(img.copy())
+            st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_column_width=True)
 
-            image_bgr = cv2_imread_no_rotate(uploaded)
-
-            with st.spinner("Processing..."):
-                result_img, crops, results = process_image_part_a(image_bgr, conf_threshold)
-
-            st.subheader("Detection + Classification Result")
-            st.image(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB), use_column_width=True)
-
-            if crops:
-                st.subheader("Individual Crops")
-                cols = st.columns(min(len(crops), 4))
-                for i, (crop, (label, conf)) in enumerate(zip(crops, results)):
-                    with cols[i % 4]:
-                        st.image(crop, caption=f"{label} ({conf:.2f})")
-
-        else:  # Video
+        else:
             st.video(uploaded)
-            if st.button("Process Video"):
-                with st.spinner("Processing video..."):
-                    temp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    with open(temp_in, "wb") as f:
-                        f.write(uploaded.getbuffer())
 
-                    cap = cv2.VideoCapture(temp_in)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    writer = cv2.VideoWriter(temp_out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
-                    progress = st.progress(0)
-                    frame_count = 0
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        processed, _, _ = process_image_part_a(frame, conf_threshold)
-                        writer.write(processed)
-                        frame_count += 1
-                        progress.progress(frame_count / total_frames)
-
-                    cap.release()
-                    writer.release()
-                    progress.empty()
-
-                    st.video(temp_out)
-                    with open(temp_out, "rb") as f:
-                        st.download_button("📥 Download Annotated Video", f, "detection_output.mp4")
-
-                    os.unlink(temp_in)
-                    os.unlink(temp_out)
-
-# ==================== PART B: Industrial OCR ====================
+# ==================== PART B ====================
 else:
-    st.header("📄 Offline Industrial OCR")
-    st.markdown("Extracts **faded/stenciled text** from industrial boxes (military crates, serial numbers)")
-
     ocr = load_ocr()
 
     def ocr_preprocess(img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
-        enhanced = clahe.apply(gray)
-        denoised = cv2.fastNlMeansDenoising(enhanced, h=15)
-        binary = cv2.adaptiveThreshold(denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5)
-        return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        clahe = cv2.createCLAHE(4.0, (8, 8)).apply(gray)
+        den = cv2.fastNlMeansDenoising(clahe, h=15)
+        bin = cv2.adaptiveThreshold(
+            den, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 15, 5
+        )
+        return cv2.cvtColor(bin, cv2.COLOR_GRAY2BGR)
 
-    uploaded = st.file_uploader("Upload Image or Video", type=["jpg", "jpeg", "png", "mp4"], key="b")
+    uploaded = st.file_uploader("Upload Image", ["jpg", "png"])
 
     if uploaded:
-        if uploaded.type.startswith("image"):
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("Original (No Auto-Rotation)")
-                img_pil = load_image_no_rotate(uploaded)
-                st.image(img_pil, use_column_width=True)
+        img = cv2_imread_no_rotate(uploaded)
+        pre = ocr_preprocess(img)
 
-            img_cv = cv2_imread_no_rotate(uploaded)
-            preprocessed = ocr_preprocess(img_cv)
+        res = ocr.ocr(pre, cls=True)
 
-            with col2:
-                st.subheader("Preprocessed for OCR")
-                st.image(cv2.cvtColor(preprocessed, cv2.COLOR_BGR2RGB), use_column_width=True)
+        for line in res or []:
+            for word in line:
+                txt, conf = word[1]
+                if conf > ocr_conf:
+                    box = np.array(word[0], np.int32)
+                    cv2.polylines(img, [box], True, (0, 255, 0), 2)
+                    cv2.putText(img, txt, (box[0][0], box[0][1] - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-            with st.spinner("Running OCR..."):
-                result = ocr.ocr(preprocessed, cls=True)
+        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), use_column_width=True)
 
-            output_img = img_cv.copy()
-            extracted = []
-            for line in result or []:
-                for word in line:
-                    if word[1][1] > conf_threshold:
-                        bbox = np.array(word[0], np.int32)
-                        text, conf = word[1]
-                        cv2.polylines(output_img, [bbox], True, (0, 255, 0), 3)
-                        cv2.putText(output_img, f"{text} ({conf:.2f})", (bbox[0][0], bbox[0][1]-10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                        extracted.append({"text": text, "confidence": round(conf, 3)})
-
-            st.subheader("OCR Result")
-            st.image(cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB), use_column_width=True)
-
-            if extracted:
-                st.subheader("Extracted Text")
-                st.json(extracted)
-                st.download_button("💾 Download JSON", json.dumps(extracted, indent=2), "ocr_results.json")
-            else:
-                st.info("No text detected above threshold.")
-
-        else:  # Video OCR
-            st.video(uploaded)
-            if st.button("Process Video (OCR)"):
-                with st.spinner("Processing video..."):
-                    temp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    with open(temp_in, "wb") as f:
-                        f.write(uploaded.getbuffer())
-
-                    cap = cv2.VideoCapture(temp_in)
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    w, h = int(cap.get(3)), int(cap.get(4))
-                    temp_out = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
-                    writer = cv2.VideoWriter(temp_out, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-
-                    progress = st.progress(0)
-                    frame_count = 0
-                    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        if frame_count % 10 == 0:
-                            pre = ocr_preprocess(frame)
-                            res = ocr.ocr(pre, cls=True)
-                            for line in res or []:
-                                for word in line:
-                                    if word[1][1] > conf_threshold:
-                                        bbox = np.array(word[0], np.int32)
-                                        cv2.polylines(frame, [bbox], True, (0, 255, 255), 2)
-                                        cv2.putText(frame, word[1][0], (bbox[0][0], bbox[0][1]-10),
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                        writer.write(frame)
-                        frame_count += 1
-                        progress.progress(frame_count / total)
-
-                    cap.release()
-                    writer.release()
-                    progress.empty()
-
-                    st.video(temp_out)
-                    with open(temp_out, "rb") as f:
-                        st.download_button("📥 Download OCR Video", f, "ocr_output.mp4")
-
-                    os.unlink(temp_in)
-                    os.unlink(temp_out)
-
-# Footer
-st.caption("Fully offline • Custom-trained models • No cloud APIs • CPU compatible")
+st.caption("Offline • CPU-only • Industrial-grade")
