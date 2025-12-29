@@ -8,24 +8,21 @@ from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision import transforms
 from PIL import Image
 from paddleocr import PaddleOCR
-import tempfile
-import os
-import json
 
 # ==================== PAGE CONFIG ====================
-st.set_page_config(page_title="Industrial AI System", layout="wide")
+st.set_page_config(page_title="Industrial AI Vision System", layout="wide")
 st.title("🛠️ Industrial AI Vision System")
-st.markdown("**Fully Offline Computer Vision Pipeline**")
+st.markdown("**Fully Offline • Production-Grade • CPU-Only**")
 
 torch.set_grad_enabled(False)
 DEVICE = torch.device("cpu")
 
-# ==================== NO AUTO-ROTATION HELPERS ====================
+# ==================== IMAGE LOADERS (NO ROTATION) ====================
 def load_image_no_rotate(uploaded_file):
     uploaded_file.seek(0)
     img = Image.open(uploaded_file)
     img = img.copy()
-    img.info.pop("exif", None)  # REMOVE EXIF → NO ROTATION
+    img.info.pop("exif", None)
     return img
 
 def cv2_imread_no_rotate(uploaded_file):
@@ -73,8 +70,10 @@ def load_ocr():
 classify_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.485, 0.456, 0.406],
-                         [0.229, 0.224, 0.225])
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
 ])
 
 CLASS_NAMES = {0: "Animal", 1: "Human"}
@@ -95,6 +94,8 @@ if mode == "Object Detection + Human/Animal Classification":
 
         boxes = preds["boxes"][keep].cpu().numpy()
 
+        results = []
+
         for box in boxes:
             x1, y1, x2, y2 = map(int, box)
             crop = rgb[y1:y2, x1:x2]
@@ -103,33 +104,61 @@ if mode == "Object Detection + Human/Animal Classification":
 
             inp = classify_transform(Image.fromarray(crop)).unsqueeze(0)
             out = classifier(inp)
-            idx = out.argmax(1).item()
-            conf = torch.softmax(out, 1)[0][idx].item()
+
+            probs = torch.softmax(out, 1)[0]
+            idx = probs.argmax().item()
+            conf = probs[idx].item()
             label = CLASS_NAMES[idx]
+
+            results.append({
+                "crop": crop,
+                "label": label,
+                "confidence": conf
+            })
 
             color = (0, 255, 0) if label == "Human" else (0, 0, 255)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, f"{label} {conf:.2f}",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        return frame
+            cv2.putText(
+                frame,
+                f"{label} {conf:.2f}",
+                (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                color,
+                2
+            )
 
-    uploaded = st.file_uploader("Upload Image or Video", ["jpg", "jpeg", "png", "mp4"])
+        return frame, results
+
+    uploaded = st.file_uploader(
+        "Upload Image",
+        ["jpg", "jpeg", "png"]
+    )
 
     if uploaded:
-        if uploaded.type.startswith("image"):
-            img_pil = load_image_no_rotate(uploaded)
-            img_cv = cv2_imread_no_rotate(uploaded)
+        img_pil = load_image_no_rotate(uploaded)
+        img_cv = cv2_imread_no_rotate(uploaded)
 
-            st.subheader("Original (No Rotation)")
-            st.image(img_pil, use_column_width=True)
+        st.subheader("Original Image")
+        st.image(img_pil, use_column_width=True)
 
-            out = process_frame(img_cv.copy())
-            st.subheader("Result")
-            st.image(cv2.cvtColor(out, cv2.COLOR_BGR2RGB), use_column_width=True)
+        out_img, detections = process_frame(img_cv.copy())
 
+        st.subheader("Annotated Output")
+        st.image(cv2.cvtColor(out_img, cv2.COLOR_BGR2RGB), use_column_width=True)
+
+        st.subheader("Detected Objects")
+
+        if len(detections) == 0:
+            st.info("No objects detected above confidence threshold.")
         else:
-            st.video(uploaded)
+            cols = st.columns(3)
+            for i, det in enumerate(detections):
+                with cols[i % 3]:
+                    st.image(det["crop"], use_column_width=True)
+                    st.markdown(
+                        f"**{det['label']}**  \nConfidence: `{det['confidence']:.2f}`"
+                    )
 
 # ==================== PART B ====================
 else:
@@ -141,7 +170,8 @@ else:
         clahe = cv2.createCLAHE(4.0, (8, 8)).apply(gray)
         den = cv2.fastNlMeansDenoising(clahe, h=15)
         bin = cv2.adaptiveThreshold(
-            den, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            den, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY, 15, 5
         )
         return cv2.cvtColor(bin, cv2.COLOR_GRAY2BGR)
@@ -154,7 +184,7 @@ else:
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Original (No Rotation)")
+            st.subheader("Original")
             st.image(img_pil, use_column_width=True)
 
         pre = ocr_preprocess(img_cv)
@@ -170,12 +200,14 @@ else:
                 if conf > conf_threshold:
                     box = np.array(word[0], np.int32)
                     cv2.polylines(img_cv, [box], True, (0, 255, 0), 2)
-                    cv2.putText(img_cv, text,
-                                (box[0][0], box[0][1] - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                                (0, 255, 0), 2)
+                    cv2.putText(
+                        img_cv, text,
+                        (box[0][0], box[0][1] - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8, (0, 255, 0), 2
+                    )
 
         st.subheader("OCR Result")
         st.image(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB), use_column_width=True)
 
-st.caption("Fully offline • CPU-only • No EXIF rotation • Industrial-grade")
+st.caption("Fully offline • CPU-only  • Industrial-grade")
